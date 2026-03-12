@@ -19,7 +19,6 @@
 
 import logging
 
-from feature_flags import FEATURE_FLAGS
 from management.permissions.workspace_inventory_access import (
     WorkspaceInventoryAccessChecker,
 )
@@ -78,86 +77,94 @@ class RoleBindingKesselAccessPermission(permissions.BasePermission):
     """
     Permission class for role binding access using Kessel Inventory API.
 
-    Checks if the user has role_binding_view or view permission on a resource
-    using the Kessel Inventory API via WorkspaceInventoryAccessChecker.
+    Checks action-specific relations against the target resource(s):
 
-    The relation to check is controlled by the USE_ROLE_BINDING_VIEW_PERMISSION feature flag:
-    - When enabled (default): uses 'role_binding_view' relation
-    - When disabled: uses 'view' relation
+    - List / list-by-subject (GET): rbac_workspaces_role_binding_view
+    - Update by subject (PUT):     rbac_workspaces_role_binding_grant AND
+                                    rbac_workspaces_role_binding_revoke
+    - Batch create (POST):         rbac_workspaces_role_binding_grant
+
+    The resource may be a workspace or tenant. For batch_create the resources
+    are read from the request body; for all other actions they come from
+    query parameters.
 
     This permission class should be used after RoleBindingSystemUserAccessPermission
     which handles system user denial logic.
     """
 
-    # Relation to check for role binding access (specific permission)
-    ROLE_BINDING_VIEW_RELATION = "role_binding_view"
-    # Fallback relation when feature flag is disabled (general permission)
-    VIEW_RELATION = "view"
+    GRANT_RELATION = "rbac_workspaces_role_binding_grant"
+    REVOKE_RELATION = "rbac_workspaces_role_binding_revoke"
+    VIEW_RELATION = "rbac_workspaces_role_binding_view"
 
-    # Allowlist of valid resource types for role binding access checks
     ALLOWED_RESOURCE_TYPES = {"workspace", "tenant"}
 
-    def _get_relation(self) -> str:
-        """Get the relation to check based on feature flag."""
-        if FEATURE_FLAGS.is_use_role_binding_view_permission_enabled():
-            return self.ROLE_BINDING_VIEW_RELATION
-        return self.VIEW_RELATION
+    def _get_relations(self, view, request) -> list[str]:
+        """Return the relation(s) that must ALL pass for the current action."""
+        action = getattr(view, "action", None)
+        if action == "batch_create":
+            return [self.GRANT_RELATION]
+        if action == "by_subject" and request.method == "PUT":
+            return [self.GRANT_RELATION, self.REVOKE_RELATION]
+        return [self.VIEW_RELATION]
+
+    def _get_resources(self, request, view) -> list[tuple[str, str]]:
+        """Extract (resource_type, resource_id) pairs for the permission check."""
+        action = getattr(view, "action", None)
+        if action == "batch_create":
+            return self._get_resources_from_body(request)
+        return self._get_resources_from_query_params(request)
+
+    def _get_resources_from_body(self, request) -> list[tuple[str, str]]:
+        """Extract unique resources from the batch_create request body."""
+        requests_data = request.data.get("requests", [])
+        resources: set[tuple[str, str]] = set()
+        for item in requests_data:
+            resource = item.get("resource", {})
+            resource_type = resource.get("type", "").lower()
+            resource_id = str(resource.get("id", ""))
+            if resource_type and resource_id:
+                resources.add((resource_type, resource_id))
+        return list(resources)
+
+    def _get_resources_from_query_params(self, request) -> list[tuple[str, str]]:
+        """Extract a single resource from query parameters."""
+        resource_id = request.query_params.get("resource_id", "").replace("\x00", "")
+        resource_type = request.query_params.get("resource_type", "").replace("\x00", "").lower()
+        if not resource_id or not resource_type:
+            return []
+        return [(resource_type, resource_id)]
 
     def has_permission(self, request, view):
         """
-        Check if the user has permission to view role bindings for a resource.
+        Check if the user has permission to access role bindings.
 
-        Args:
-            request: The HTTP request object
-            view: The view being accessed
-
-        Returns:
-            bool: True if the user has permission, False otherwise
+        For each target resource, every required relation must be granted.
         """
-        # Get resource_id and resource_type from query params (for by-subject endpoint)
-        resource_id = request.query_params.get("resource_id", "").replace("\x00", "")
-        resource_type = request.query_params.get("resource_type", "").replace("\x00", "").lower()
+        resources = self._get_resources(request, view)
 
-        # If no resource_id or resource_type provided, let view validation handle it
-        if not resource_id or not resource_type:
+        if not resources:
             return True
 
-        # Validate resource_type against allowlist and fail closed on unknown types
-        if resource_type not in self.ALLOWED_RESOURCE_TYPES:
-            logger.debug("Denied access for unknown resource_type: %s", resource_type)
-            return False
+        for resource_type, _ in resources:
+            if resource_type not in self.ALLOWED_RESOURCE_TYPES:
+                logger.debug("Denied access for unknown resource_type: %s", resource_type)
+                return False
 
-        # For tenant resources, only org admins are allowed (no Kessel check)
-        if resource_type == "tenant":
-            is_org_admin = getattr(request.user, "admin", False)
-            if not is_org_admin:
-                logger.debug("Denied access for tenant resource: only org admins allowed")
-                return False
-            tenant = getattr(request, "tenant", None)
-            if tenant is None:
-                logger.debug("Denied access for tenant resource: no tenant on request")
-                return False
-            expected_resource_id = tenant.tenant_resource_id()
-            if expected_resource_id is None or resource_id != expected_resource_id:
-                logger.debug(
-                    "Denied access for tenant resource: resource_id %s does not match tenant %s",
-                    resource_id,
-                    expected_resource_id,
-                )
-                return False
-            return True
-
-        # Get principal_id for Kessel API check using the reusable utility
         principal_id = get_kessel_principal_id(request)
         if not principal_id:
             return False
 
-        # Use WorkspaceInventoryAccessChecker for the Kessel permission check
-        relation = self._get_relation()
+        relations = self._get_relations(view, request)
         checker = WorkspaceInventoryAccessChecker()
-        return checker.check_resource_access(
-            resource_type=resource_type,
-            resource_id=resource_id,
-            principal_id=principal_id,
-            relation=relation,
-        )
+
+        for resource_type, resource_id in resources:
+            for relation in relations:
+                if not checker.check_resource_access(
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    principal_id=principal_id,
+                    relation=relation,
+                ):
+                    return False
+
+        return True
